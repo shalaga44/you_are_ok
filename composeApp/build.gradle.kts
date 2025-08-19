@@ -44,8 +44,26 @@ kotlin {
     
     sourceSets {
         androidMain.dependencies {
+            implementation(files("libs/polar-ble-sdk.aar"))
+            // Only needed if FEATURE_POLAR_FILE_TRANSFER used
+            implementation (files("libs/polar-protobuf-release.aar"))
+            // Only needed if FEATURE_POLAR_FILE_TRANSFER used
+            implementation("commons-io:commons-io:2.4")
+            // Only needed if FEATURE_POLAR_FILE_TRANSFER used
+            implementation ("com.google.protobuf:protobuf-java:3.1.0")
             implementation(compose.preview)
             implementation(libs.androidx.activity.compose)
+            implementation ("androidx.appcompat:appcompat:1.7.1")
+
+            implementation ("io.reactivex.rxjava3:rxjava:3.0.0")
+            implementation ("io.reactivex.rxjava3:rxandroid:3.0.0")
+            implementation ("io.reactivex.rxjava2:rxjava:2.1.5")
+            implementation ("io.reactivex.rxjava2:rxandroid:2.0.1")
+            implementation("androidx.navigation:navigation-compose:2.9.3")
+            implementation("com.squareup.okhttp3:okhttp:4.12.0")
+            implementation ("com.android.volley:volley:1.2.0")
+
+
         }
         commonMain.dependencies {
             implementation(compose.runtime)
