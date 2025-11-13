@@ -5,7 +5,6 @@ import io.ktor.server.engine.*
 import io.ktor.server.netty.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
-
 import com.google.gson.Gson
 import com.google.gson.annotations.SerializedName
 import com.zaxxer.hikari.HikariDataSource
@@ -23,6 +22,7 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.launch
 import org.jetbrains.exposed.dao.id.UUIDTable
 import org.jetbrains.exposed.sql.*
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
 import org.jetbrains.exposed.sql.javatime.datetime
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.slf4j.event.Level
@@ -71,6 +71,7 @@ data class LivePoint(
     val hr_mean: Double?,
     val rmssd: Double?,
     val pnn50: Double?,
+    val ppg_mean: Double?,
     val status: String?,
     val status_basic: String?,
     val status_sliding: String?
@@ -132,11 +133,9 @@ object EventLabels : UUIDTable("eventlabel") {
 
 object Db {
     fun init(env: ApplicationEnvironment) {
-        val url = System.getenv("DB_URL")
-            ?: "jdbc:postgresql://localhost:5432/you_are_okay?sslmode=disable"
+        val url = System.getenv("DB_URL") ?: "jdbc:postgresql://localhost:5432/you_are_okay?sslmode=disable"
         val user = System.getenv("DB_USER") ?: "root"
         val pass = System.getenv("DB_PASS") ?: "postgres"
-
         val cfg = com.zaxxer.hikari.HikariConfig().apply {
             jdbcUrl = url
             username = user
@@ -186,8 +185,7 @@ private fun computeRmssdAndPnn50(nnMs: List<Double>): Pair<Double, Double> {
     return rmssd to pnn50
 }
 
-private fun Iterable<Double>.averageOrNull(): Double? =
-    if (!this.iterator().hasNext()) null else this.average()
+private fun Iterable<Double>.averageOrNull(): Double? = if (!this.iterator().hasNext()) null else this.average()
 
 private fun baselineRowCountForFrequency(freqHz: Int): Int = (10 * 60) / freqHz
 
@@ -205,20 +203,13 @@ private fun lastValidHeartRate(device: String, uuid: UUID): Double? = transactio
 object LiveBus {
     private val gson = Gson()
     val streams = java.util.concurrent.ConcurrentHashMap<String, MutableSharedFlow<LivePoint>>()
-
     fun flowFor(device: String, uuid: UUID): MutableSharedFlow<LivePoint> =
         streams.computeIfAbsent("$device|$uuid") {
-            MutableSharedFlow(
-                replay = 64,
-                extraBufferCapacity = 512,
-                onBufferOverflow = BufferOverflow.DROP_OLDEST
-            )
+            MutableSharedFlow(replay = 64, extraBufferCapacity = 512, onBufferOverflow = BufferOverflow.DROP_OLDEST)
         }
-
     suspend fun emit(device: String, uuid: UUID, point: LivePoint) {
         flowFor(device, uuid).emit(point)
     }
-
     fun toJson(any: Any): String = gson.toJson(any)
 }
 
@@ -230,7 +221,6 @@ fun Application.module() {
     install(WebSockets)
 
     Db.init(environment)
-
     val gson = Gson()
 
     routing {
@@ -239,7 +229,7 @@ fun Application.module() {
             val uuidStr = call.request.queryParameters["uuid"] ?: ""
             val uuid = uuidStr.toUuidOrOrThrow()
 
-            val testInfo: TestInfo = transaction {
+            val info: TestInfo = transaction {
                 val list = Responses
                     .slice(Responses.createdAt)
                     .select { (Responses.deviceCode eq device) and (Responses.uuid eq uuid) }
@@ -255,29 +245,6 @@ fun Application.module() {
                 val hrRatio = job?.get(Jobs.hrThreshold) ?: HEART_RATE_THRESHOLD_RATIO
                 val rmssdRatio = job?.get(Jobs.hrvThreshold) ?: RMSSD_THRESHOLD_RATIO
                 TestInfo(count, startAt, endAt, freqHz, baselineRows, hrRatio, rmssdRatio)
-            }
-
-            val (labelsRowJson, ppgRowJson, hrRowJson) = transaction {
-                val hrSeries = Responses
-                    .slice(Responses.hrMean)
-                    .select { (Responses.deviceCode eq device) and (Responses.uuid eq uuid) }
-                    .orderBy(Responses.createdAt to SortOrder.ASC)
-                    .mapNotNull { it[Responses.hrMean] }
-                    .filter { it in MIN_HEART_RATE_BPM..MAX_HEART_RATE_BPM }
-
-                val ppgSeries = Requests
-                    .slice(Requests.ppg)
-                    .select { (Requests.device eq device) and (Requests.uuid eq uuid) }
-                    .orderBy(Requests.createdAt to SortOrder.ASC)
-                    .map { it[Requests.ppg] }
-
-                val n = hrSeries.size
-                val labels = (1..n).toList()
-                Triple(
-                    Gson().toJson(labels),
-                    Gson().toJson(ppgSeries.take(n)),
-                    Gson().toJson(hrSeries)
-                )
             }
 
             val html = """
@@ -304,35 +271,41 @@ fun Application.module() {
                       <ul>
                         <li><b>Device Code:</b>&nbsp;$device</li>
                         <li><b>UUID:</b>&nbsp;$uuidStr</li>
-                        <li><b>Records:</b>&nbsp;${testInfo.recordCount}</li>
-                        <li><b>Frequency:</b>&nbsp;${testInfo.frequencyHz}</li>
-                        <li><b>HR_threshold:</b>&nbsp;${testInfo.heartRateThresholdRatio}</li>
-                        <li><b>HRV_threshold:</b>&nbsp;${testInfo.rmssdThresholdRatio}</li>
-                        <li><b>Base Line Size (Window Size):</b>&nbsp;${testInfo.baselineRowCount}</li>
-                        <li><b>Started at:</b>&nbsp;${testInfo.startTime}</li>
-                        <li><b>Ended at:</b>&nbsp;${testInfo.endTime}</li>
+                        <li><b>Records:</b>&nbsp;${info.recordCount}</li>
+                        <li><b>Frequency:</b>&nbsp;${info.frequencyHz}</li>
+                        <li><b>HR_threshold:</b>&nbsp;${info.heartRateThresholdRatio}</li>
+                        <li><b>HRV_threshold:</b>&nbsp;${info.rmssdThresholdRatio}</li>
+                        <li><b>Base Line Size (Window Size):</b>&nbsp;${info.baselineRowCount}</li>
+                        <li><b>Started at:</b>&nbsp;${info.startTime}</li>
+                        <li><b>Ended at:</b>&nbsp;${info.endTime}</li>
                       </ul>
                     </div>
 
                     <h2>Content</h2>
-
+                <div class="mb-2">
+                  <span class="badge" style="background:#ff9f40">SD</span>
+                  <small class="text-muted ml-1">= Stress Detection (baseline)</small>
+                  &nbsp;&nbsp;
+                  <span class="badge" style="background:purple">SW</span>
+                  <small class="text-muted ml-1">= Sliding Window</small>
+                </div>
                     <div class="row">
                       <div class="col-12">
                         <h4>RMSSD vs Time (live) + detections</h4>
-                        <canvas id="line-chart"></canvas>
+                        <canvas id="rmssd-time-chart"></canvas>
                       </div>
                     </div>
 
                     <div class="spacer"></div>
-
+                   
+                    
                     <div class="row">
                       <div class="col-12">
-                        <h4>PPG Raw Data vs Heart Rate vs Row Number</h4>
-                        <canvas id="ppg-line-chart"></canvas>
+                        <h4>PPG Raw Data vs Heart Rate vs Row Number (live)</h4>
+                        <canvas id="ppg-row-chart"></canvas>
                       </div>
                     </div>
-
-                    <div class="pb-5 pt-3">
+                   <div class="pb-5 pt-3">
                       <h2>Summary</h2>
                       <p>For the current test:</p>
                       <ul>
@@ -340,6 +313,7 @@ fun Application.module() {
                         <li>There are <b id="slidingCount">0</b> stress events detected by <strong class="text-capitalize">sliding window algorithm</strong></li>
                       </ul>
                     </div>
+                
                   </div>
 
                   <script>
@@ -349,8 +323,50 @@ fun Application.module() {
                     const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
                     const ws = new WebSocket(`${'$'}{wsProto}://${'$'}{location.host}/api/v1/ws?device=${'$'}{encodeURIComponent(device)}&uuid=${'$'}{encodeURIComponent(uuid)}`);
 
-                    const ctx = document.getElementById('line-chart').getContext('2d');
-                    const config = {
+                    const MAX_POINTS = 1200;
+                    let basicCount = 0, slidingCount = 0, annIdx = 0;
+                    let prevBasic = false, prevSliding = false;
+
+                    function updateEventCounters(basic, sliding) {
+                      if (basic && !prevBasic) {
+                        basicCount++;
+                        document.getElementById('basicCount').textContent = basicCount;
+                      }
+                      if (sliding && !prevSliding) {
+                        slidingCount++;
+                        document.getElementById('slidingCount').textContent = slidingCount;
+                      }
+                      prevBasic = basic;
+                      prevSliding = sliding;
+                    }
+
+                    function addLabeledDot(cfg, idPrefix, labelText, xScaleID, yScaleID, xValue, yValue, dotColor) {
+                      if (yValue == null || xValue == null) return;
+                      cfg.options.plugins.annotation.annotations[idPrefix + (annIdx++)] = {
+                        type: 'point',
+                        xScaleID: xScaleID,
+                        yScaleID: yScaleID,
+                        xValue: xValue,
+                        yValue: yValue,
+                        backgroundColor: dotColor,
+                        radius: 5,
+                        borderWidth: 0,
+                        label: {
+                          display: true,
+                          content: labelText,
+                          position: 'end',
+                          yAdjust: -8,
+                          backgroundColor: 'rgba(255,255,255,0.9)',
+                          color: '#111',
+                          padding: 2,
+                          borderRadius: 4,
+                          font: { size: 10, weight: 'bold' }
+                        }
+                      };
+                    }
+
+                    const rmssdCtx = document.getElementById('rmssd-time-chart').getContext('2d');
+                    const rmssdCfg = {
                       type: 'line',
                       data: {
                         labels: [],
@@ -365,7 +381,7 @@ fun Application.module() {
                         plugins: {
                           title: { display: true, text: 'RMSSD vs Time (with stress detections)' },
                           legend: { display: true },
-                          annotation: { drawTime: 'afterDatasetsDraw', annotations: { } }
+                          annotation: { drawTime: 'afterDatasetsDraw', annotations: {} }
                         },
                         scales: {
                           x: { title: { display: true, text: 'Time' } },
@@ -374,49 +390,65 @@ fun Application.module() {
                         }
                       }
                     };
-                    const chart = new Chart(ctx, config);
+                    const rmssdChart = new Chart(rmssdCtx, rmssdCfg);
 
-                    const MAX_POINTS = 1200;
-                    let basicCount = 0, slidingCount = 0, annIdx = 0;
-
-                    function pushPoint(ts, hr, rmssd, basicWarn, slidingWarn) {
+                    function pushRmssdPoint(ts, hr, rmssd, basicWarn, slidingWarn) {
                       const label = new Date(ts).toLocaleTimeString();
-                      chart.data.labels.push(label);
-                      chart.data.datasets[0].data.push(rmssd ?? null);
-                      chart.data.datasets[1].data.push(hr ?? null);
+                      rmssdChart.data.labels.push(label);
+                      rmssdChart.data.datasets[0].data.push(rmssd ?? null);
+                      rmssdChart.data.datasets[1].data.push(hr ?? null);
 
-                      if (basicWarn && rmssd != null) {
-                        config.options.plugins.annotation.annotations['basic_' + (annIdx++)] = {
-                          type: 'point',
-                          xScaleID: 'x',
-                          yScaleID: 'y2',
-                          xValue: label,
-                          yValue: rmssd,
-                          backgroundColor: 'rgba(255, 159, 64, 0.9)',
-                          radius: 5,
-                          borderWidth: 0
-                        };
-                        document.getElementById('basicCount').textContent = (++basicCount);
-                      }
-                      if (slidingWarn && rmssd != null) {
-                        config.options.plugins.annotation.annotations['slide_' + (annIdx++)] = {
-                          type: 'point',
-                          xScaleID: 'x',
-                          yScaleID: 'y2',
-                          xValue: label,
-                          yValue: rmssd,
-                          backgroundColor: 'rgba(128, 0, 128, 0.9)',
-                          radius: 5,
-                          borderWidth: 0
-                        };
-                        document.getElementById('slidingCount').textContent = (++slidingCount);
+                      if (rmssd != null && (basicWarn || slidingWarn)) {
+                        const both = basicWarn && slidingWarn;
+                        const tag = both ? 'SD+SW' : (basicWarn ? 'SD' : 'SW');
+                        const color = both ? 'rgba(60,60,60,0.95)' : (basicWarn ? 'rgba(255,159,64,0.9)' : 'rgba(128,0,128,0.9)');
+                        addLabeledDot(rmssdCfg, 'evt_', tag, 'x', 'y2', label, rmssd, color);
                       }
 
-                      if (chart.data.labels.length > MAX_POINTS) {
-                        chart.data.labels.shift();
-                        chart.data.datasets.forEach(ds => ds.data.shift());
+                      if (rmssdChart.data.labels.length > MAX_POINTS) {
+                        rmssdChart.data.labels.shift();
+                        rmssdChart.data.datasets.forEach(ds => ds.data.shift());
                       }
-                      chart.update('none');
+                      rmssdChart.update('none');
+                    }
+
+                    const ppgCtx = document.getElementById('ppg-row-chart').getContext('2d');
+                    const ppgCfg = {
+                      type: 'line',
+                      data: {
+                        labels: [],
+                        datasets: [
+                          { label: 'PPG (mean/normalized)', data: [], borderColor: '#1EAEDB', backgroundColor: '#1EAEDB20', tension: 0.2, pointRadius: 0, yAxisID: 'py' },
+                          { label: 'Heart Rate (bpm)', data: [], borderColor: '#FF6384', backgroundColor: '#FF638420', tension: 0.2, pointRadius: 0, yAxisID: 'hy' }
+                        ]
+                      },
+                      options: {
+                        responsive: true,
+                        interaction: { mode: 'nearest', intersect: false },
+                        plugins: {
+                          title: { display: true, text: 'PPG Raw Data vs Heart Rate vs Row Number (live)' }
+                        },
+                        scales: {
+                          x: { title: { display: true, text: 'Row Number' } },
+                          py: { type: 'linear', position: 'left', title: { display: true, text: 'PPG' } },
+                          hy: { type: 'linear', position: 'right', title: { display: true, text: 'Heart Rate (bpm)' }, grid: { drawOnChartArea: false } }
+                        }
+                      }
+                    };
+                    const ppgChart = new Chart(ppgCtx, ppgCfg);
+                    let rowCounter = 0;
+
+                    function pushPpgRowPoint(hr, ppgMean) {
+                      rowCounter += 1;
+                      ppgChart.data.labels.push(String(rowCounter));
+                      ppgChart.data.datasets[0].data.push(ppgMean ?? null);
+                      ppgChart.data.datasets[1].data.push(hr ?? null);
+
+                      if (ppgChart.data.labels.length > MAX_POINTS) {
+                        ppgChart.data.labels.shift();
+                        ppgChart.data.datasets.forEach(ds => ds.data.shift());
+                      }
+                      ppgChart.update('none');
                     }
 
                     ws.onmessage = (evt) => {
@@ -424,37 +456,14 @@ fun Application.module() {
                       const basic = p.status_basic === 'basic_warning';
                       const sliding = p.status_sliding === 'sliding_warning';
                       if (typeof p.t === 'number') {
-                        pushPoint(p.t, p.hr_mean ?? null, p.rmssd ?? null, basic, sliding);
+                        pushRmssdPoint(p.t, p.hr_mean ?? null, p.rmssd ?? null, basic, sliding);
+                        pushPpgRowPoint(p.hr_mean ?? null, p.ppg_mean ?? null);
+                        updateEventCounters(basic, sliding);
                       }
                     };
-
-                    const labelsRow = $labelsRowJson;
-                    const ppgData   = $ppgRowJson;
-                    const hrRow     = $hrRowJson;
-
-                    const ppgCtx = document.getElementById('ppg-line-chart').getContext('2d');
-                    const ppgConfig = {
-                      type: 'line',
-                      data: {
-                        labels: labelsRow,
-                        datasets: [
-                          { label: 'PPG', data: ppgData, borderColor: '#1EAEDB', backgroundColor: '#1EAEDB20', tension: 0.2, pointRadius: 0, yAxisID: 'py' },
-                          { label: 'Heart Rate', data: hrRow, borderColor: '#FF6384', backgroundColor: '#FF638420', tension: 0.2, pointRadius: 0, yAxisID: 'hy' }
-                        ]
-                      },
-                      options: {
-                        responsive: true,
-                        plugins: {
-                          title: { display: true, text: 'PPG Raw Data vs Heart Rate vs Row Number' },
-                          annotation: { drawTime: 'afterDatasetsDraw' }
-                        },
-                        scales: {
-                          py: { type: 'linear', position: 'left', title: { display: true, text: 'PPG (normalized/avg)' } },
-                          hy: { type: 'linear', position: 'right', title: { display: true, text: 'Heart Rate (bpm)' }, grid: { drawOnChartArea: false } }
-                        }
-                      }
-                    };
-                    const ppgChart = new Chart(ppgCtx, ppgConfig);
+                    ws.onopen = () => console.log('WS open');
+                    ws.onclose = (e) => console.log('WS closed', e.code, e.reason);
+                    ws.onerror = (e) => console.error('WS error', e);
                   </script>
                 </body>
                 </html>
@@ -464,7 +473,6 @@ fun Application.module() {
         }
 
         route("/api/v1") {
-
             post("/uuid") {
                 val body = runCatching { call.receive<UuidReq>() }.getOrNull()
                 val uuid = body?.uuid?.toUuidOrNull()
@@ -578,9 +586,7 @@ fun Application.module() {
                         val basicHrvDrop = (rmssd != null && baseRmssd != null && rmssd!! * rmssdRatio < baseRmssd)
                         val basicHrRise  = (hrMean != null && baseHr != null && hrMean!! > baseHr * hrRatio)
                         val basicPnnDrop = (pnn50 != null && basePnn != null && pnn50!! * PNN50_THRESHOLD_RATIO < basePnn)
-                        if (basicHrvDrop && basicHrRise && basicPnnDrop) {
-                            statusBasic = "basic_warning"
-                        }
+                        if (basicHrvDrop && basicHrRise && basicPnnDrop) statusBasic = "basic_warning"
                     }
 
                     if (totalCount > baselineRows) {
@@ -601,9 +607,7 @@ fun Application.module() {
                         val slideHrvDrop = (rmssd != null && winRmssd != null && rmssd!! * rmssdRatio < winRmssd)
                         val slideHrRise  = (hrMean != null && winHr != null && hrMean!! > winHr * hrRatio)
                         val slidePnnDrop = (pnn50 != null && winPnn != null && pnn50!! * PNN50_THRESHOLD_RATIO < winPnn)
-                        if (slideHrvDrop && slideHrRise && slidePnnDrop) {
-                            statusSliding = "sliding_warning"
-                        }
+                        if (slideHrvDrop && slideHrRise && slidePnnDrop) statusSliding = "sliding_warning"
                     }
 
                     if (statusBasic == "basic_warning" || statusSliding == "sliding_warning") {
@@ -639,6 +643,7 @@ fun Application.module() {
                                 hr_mean = hrMean,
                                 rmssd = rmssd,
                                 pnn50 = pnn50,
+                                ppg_mean = ppgMean,
                                 status = status,
                                 status_basic = statusBasic,
                                 status_sliding = statusSliding
@@ -677,6 +682,7 @@ fun Application.module() {
                                 hr_mean = hrMean,
                                 rmssd = null,
                                 pnn50 = null,
+                                ppg_mean = ppgMean,
                                 status = "success",
                                 status_basic = "success",
                                 status_sliding = "success"
@@ -718,12 +724,9 @@ fun Application.module() {
 
 private data class Quadruple<A, B, C, D>(val first: A, val second: B, val third: C, val fourth: D)
 
-fun String.toUuidOrNull(): UUID? =
-    runCatching { toUuidOrOrThrow() }.getOrNull()
-
+fun String.toUuidOrNull(): UUID? = runCatching { toUuidOrOrThrow() }.getOrNull()
 fun String.toUuidOrOrThrow(): UUID = UUID.fromString(this@toUuidOrOrThrow.trim())
 
 fun main() {
-    embeddedServer(Netty, port = SERVER_PORT, host = "0.0.0.0", module = Application::module)
-        .start(wait = true)
+    embeddedServer(Netty, port = SERVER_PORT, host = "0.0.0.0", module = Application::module).start(wait = true)
 }
