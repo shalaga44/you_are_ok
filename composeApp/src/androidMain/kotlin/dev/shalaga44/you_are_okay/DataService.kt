@@ -46,7 +46,7 @@ class DataService : Service() {
 
     companion object {
 
-        const val BASE_URL = "http://192.168.44.100:8080/api/v1"
+        const val BASE_URL = "http://192.168.44.103:8080/api/v1"
         private const val STRESS_ENDPOINT = "$BASE_URL/stress?mode=hrv"
         const val UUID_ENDPOINT = "$BASE_URL/uuid"
 
