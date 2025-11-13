@@ -29,6 +29,7 @@ import org.slf4j.event.Level
 import java.time.format.DateTimeFormatter
 import java.util.UUID
 import kotlin.math.abs
+import kotlin.math.exp
 import kotlin.math.pow
 import kotlin.math.sqrt
 
@@ -62,7 +63,9 @@ data class StressResp(
     val device: String,
     val uuid: UUID,
     val hr_mean: Double?,
-    val HRV: Map<String, Map<String, Double>>? = null
+    val HRV: Map<String, Map<String, Double>>? = null,
+    val ml_score: Double? = null,
+    val ml_label: String? = null
 )
 
 data class LivePoint(
@@ -74,7 +77,9 @@ data class LivePoint(
     val ppg_mean: Double?,
     val status: String?,
     val status_basic: String?,
-    val status_sliding: String?
+    val status_sliding: String?,
+    val ml_score: Double? = null,
+    val ml_label: String? = null
 )
 
 data class TestInfo(
@@ -185,6 +190,33 @@ private fun computeRmssdAndPnn50(nnMs: List<Double>): Pair<Double, Double> {
     return rmssd to pnn50
 }
 
+
+private fun mlStressProbability(
+    hr: Double?,
+    rmssd: Double?,
+    pnn50: Double?
+): Double? {
+    if (hr == null || rmssd == null || pnn50 == null) return null
+
+
+
+    val w0 = -44.24435565553951      // bias
+    val wHr = 0.5014126733435821
+    val wRmssd =  0.008600895019301714
+    val wPnn50 =  -0.03421459783035022
+
+    val z = w0 + wHr * hr + wRmssd * rmssd + wPnn50 * pnn50
+    return 1.0 / (1.0 + exp(-z))
+}
+
+private fun mlLabelFromScore(score: Double?): String? =
+    when {
+        score == null -> null
+        score >= 0.7 -> "ml_stress"
+        score <= 0.3 -> "ml_relaxed"
+        else -> "ml_uncertain"
+    }
+
 private fun Iterable<Double>.averageOrNull(): Double? = if (!this.iterator().hasNext()) null else this.average()
 
 private fun baselineRowCountForFrequency(freqHz: Int): Int = (10 * 60) / freqHz
@@ -282,13 +314,25 @@ fun Application.module() {
                     </div>
 
                     <h2>Content</h2>
-                <div class="mb-2">
-                  <span class="badge" style="background:#ff9f40">SD</span>
-                  <small class="text-muted ml-1">= Stress Detection (baseline)</small>
-                  &nbsp;&nbsp;
-                  <span class="badge" style="background:purple">SW</span>
-                  <small class="text-muted ml-1">= Sliding Window</small>
-                </div>
+                    <div class="mb-2">
+                      <span class="badge" style="background:#ff9f40">SD</span>
+                      <small class="text-muted ml-1">= Stress Detection (baseline)</small>
+                      &nbsp;&nbsp;
+                      <span class="badge" style="background:purple">SW</span>
+                      <small class="text-muted ml-1">= Sliding Window</small>
+                    </div>
+
+                    <div class="pb-3">
+                      <h4>ML Status</h4>
+                      <p>
+                        Current ML stress probability:
+                        <b id="mlScore">-</b>
+                        &nbsp;&nbsp;
+                        Label:
+                        <span id="mlLabel" class="badge badge-secondary">-</span>
+                      </p>
+                    </div>
+
                     <div class="row">
                       <div class="col-12">
                         <h4>RMSSD vs Time (live) + detections</h4>
@@ -297,15 +341,15 @@ fun Application.module() {
                     </div>
 
                     <div class="spacer"></div>
-                   
-                    
+
                     <div class="row">
                       <div class="col-12">
                         <h4>PPG Raw Data vs Heart Rate vs Row Number (live)</h4>
                         <canvas id="ppg-row-chart"></canvas>
                       </div>
                     </div>
-                   <div class="pb-5 pt-3">
+
+                    <div class="pb-5 pt-3">
                       <h2>Summary</h2>
                       <p>For the current test:</p>
                       <ul>
@@ -338,6 +382,34 @@ fun Application.module() {
                       }
                       prevBasic = basic;
                       prevSliding = sliding;
+                    }
+
+                    function updateMlStatus(score, label) {
+                      const scoreEl = document.getElementById('mlScore');
+                      const labelEl = document.getElementById('mlLabel');
+
+                      if (score == null) {
+                        scoreEl.textContent = '-';
+                      } else {
+                        scoreEl.textContent = score.toFixed(3);
+                      }
+
+                      let text = '-';
+                      let cls = 'badge badge-secondary';
+
+                      if (label === 'ml_stress') {
+                        text = 'ML: Stress';
+                        cls = 'badge badge-danger';
+                      } else if (label === 'ml_relaxed') {
+                        text = 'ML: Relaxed';
+                        cls = 'badge badge-success';
+                      } else if (label === 'ml_uncertain') {
+                        text = 'ML: Uncertain';
+                        cls = 'badge badge-warning';
+                      }
+
+                      labelEl.textContent = text;
+                      labelEl.className = cls;
                     }
 
                     function addLabeledDot(cfg, idPrefix, labelText, xScaleID, yScaleID, xValue, yValue, dotColor) {
@@ -455,6 +527,12 @@ fun Application.module() {
                       const p = JSON.parse(evt.data);
                       const basic = p.status_basic === 'basic_warning';
                       const sliding = p.status_sliding === 'sliding_warning';
+
+                      // ML from live point
+                      const mlScore = (typeof p.ml_score === 'number') ? p.ml_score : null;
+                      const mlLabel = p.ml_label || null;
+                      updateMlStatus(mlScore, mlLabel);
+
                       if (typeof p.t === 'number') {
                         pushRmssdPoint(p.t, p.hr_mean ?? null, p.rmssd ?? null, basic, sliding);
                         pushPpgRowPoint(p.hr_mean ?? null, p.ppg_mean ?? null);
@@ -621,6 +699,9 @@ fun Application.module() {
                     )
                     val respBodyStr = gson.toJson(hrvJson)
 
+                    val mlScore = mlStressProbability(hrMean, rmssd, pnn50)
+                    val mlLabel = mlLabelFromScore(mlScore)
+
                     val insertedId = transaction {
                         Responses.insert {
                             it[Responses.deviceCode] = device
@@ -646,7 +727,9 @@ fun Application.module() {
                                 ppg_mean = ppgMean,
                                 status = status,
                                 status_basic = statusBasic,
-                                status_sliding = statusSliding
+                                status_sliding = statusSliding,
+                                ml_score = mlScore,
+                                ml_label = mlLabel
                             )
                         )
                     }
@@ -659,7 +742,9 @@ fun Application.module() {
                             device = device,
                             uuid = uuid,
                             hr_mean = hrMean,
-                            HRV = hrvJson
+                            HRV = hrvJson,
+                            ml_score = mlScore,
+                            ml_label = mlLabel
                         )
                     )
                 } else {
@@ -685,7 +770,9 @@ fun Application.module() {
                                 ppg_mean = ppgMean,
                                 status = "success",
                                 status_basic = "success",
-                                status_sliding = "success"
+                                status_sliding = "success",
+                                ml_score = null,
+                                ml_label = null
                             )
                         )
                     }
@@ -697,7 +784,9 @@ fun Application.module() {
                             device = device,
                             uuid = uuid,
                             hr_mean = hrMean,
-                            HRV = null
+                            HRV = null,
+                            ml_score = null,
+                            ml_label = null
                         )
                     )
                 }
