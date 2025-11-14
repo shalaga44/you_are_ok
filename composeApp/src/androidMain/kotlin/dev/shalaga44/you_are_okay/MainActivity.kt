@@ -11,82 +11,42 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
-import android.text.Editable
-import android.text.InputType
-import android.text.TextWatcher
-import android.view.View
-import android.widget.Button
-import android.widget.EditText
-import android.widget.LinearLayout
-import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.appcompat.app.AppCompatActivity
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.Button
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.core.content.ContextCompat
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : ComponentActivity() {
 
     private lateinit var bluetoothAdapter: BluetoothAdapter
     private lateinit var enableBtLauncher: ActivityResultLauncher<Intent>
     private lateinit var permLauncher: ActivityResultLauncher<Array<String>>
     private lateinit var notifPermLauncher: ActivityResultLauncher<String>
 
-    private lateinit var tvStatus: TextView
-    private lateinit var etUserId: EditText
-    private lateinit var btnPick: Button
-    private lateinit var btnStartSvc: Button
-    private lateinit var btnOpenDashboard: Button
-
-    private var selectedDeviceName: String? = null
-    private var selectedDeviceAddr: String? = null
-    private var userId: String = ""
-
+    private var selectedDeviceName by mutableStateOf<String?>(null)
+    private var selectedDeviceAddr by mutableStateOf<String?>(null)
+    private var userId by mutableStateOf("")
 
     private val prefsName = "you_are_okay_prefs"
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(48, 72, 48, 48)
-        }
-
-        tvStatus = TextView(this).apply {
-            textSize = 18f
-            text = "Select a paired Polar device to begin."
-        }
-
-
-        etUserId = EditText(this).apply {
-            hint = "User ID"
-            inputType = InputType.TYPE_CLASS_NUMBER
-        }
-
-        btnPick = Button(this).apply {
-            text = "Select Bluetooth Device"
-            setOnClickListener { pickDevice() }
-        }
-        btnStartSvc = Button(this).apply {
-            text = "Start Data Service"
-            setOnClickListener { startDataServiceIfReady() }
-        }
-        btnOpenDashboard = Button(this).apply {
-            text = "Open Dashboard"
-            setOnClickListener { openDashboard() }
-        }
-
-        listOf<View>(
-            tvStatus, space(),
-            etUserId, space(),
-            btnPick, space(),
-            btnStartSvc, space(),
-            btnOpenDashboard
-        ).forEach(root::addView)
-        setContentView(root)
-
 
         val btMgr = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         bluetoothAdapter = btMgr.adapter ?: run {
@@ -95,82 +55,87 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-
-        enableBtLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
-            ensureReadyState()
-        }
-        permLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
-            ensureReadyState()
-        }
-        notifPermLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* noop */ }
-
+        enableBtLauncher =
+            registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+                ensureReadyState()
+            }
+        permLauncher =
+            registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+                ensureReadyState()
+            }
+        notifPermLauncher =
+            registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* noop */ }
 
         val sp = getSharedPreferences(prefsName, Context.MODE_PRIVATE)
         selectedDeviceAddr = sp.getString(DataService.EXTRA_DEVICE_ID, null)
         selectedDeviceName = sp.getString(DataService.EXTRA_DEVICE_NAME, null)
         userId = sp.getString(DataService.EXTRA_USER_ID, "") ?: ""
-        etUserId.setText(userId)
-        updateStatus()
-
-
-        etUserId.addTextChangedListener(object : TextWatcher {
-            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
-            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
-            override fun afterTextChanged(s: Editable?) {
-                userId = s?.toString()?.trim().orEmpty()
-                sp.edit().putString(DataService.EXTRA_USER_ID, userId).apply()
-                updateStatus()
-            }
-        })
-
 
         if (Build.VERSION.SDK_INT >= 33) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            if (ContextCompat.checkSelfPermission(
+                    this,
+                    Manifest.permission.POST_NOTIFICATIONS
+                ) != PackageManager.PERMISSION_GRANTED
+            ) {
                 notifPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
             }
         }
 
-
         ensureReadyState()
+
+        setContent {
+            MaterialTheme {
+                Surface(Modifier.fillMaxSize()) {
+                    MainScreen(
+                        deviceName = selectedDeviceName,
+                        deviceAddr = selectedDeviceAddr,
+                        userId = userId,
+                        onUserIdChange = { new ->
+                            userId = new.trim()
+                            sp.edit().putString(DataService.EXTRA_USER_ID, userId).apply()
+                        },
+                        onPickDevice = { pickDevice() },
+                        onStartService = { startDataServiceIfReady() },
+                        onOpenDashboard = { openDashboard() }
+                    )
+                }
+            }
+        }
     }
 
-
-    private fun space(): View = View(this).apply {
-        layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 36)
-    }
-
-    private fun updateStatus() {
-        val name = selectedDeviceName ?: "None"
-        val addr = selectedDeviceAddr ?: "—"
-        val uid = if (userId.isBlank()) "—" else userId
-        tvStatus.text = "Device: $name\nMAC: $addr\nUser ID: $uid"
-    }
-
-    private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
-
+    private fun toast(msg: String) =
+        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
 
     private fun ensureReadyState() {
-
         if (!bluetoothAdapter.isEnabled) {
             enableBtLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
             return
         }
 
-
         val neededPerms = mutableListOf<String>()
 
-
         if (Build.VERSION.SDK_INT >= 31) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+            if (ContextCompat.checkSelfPermission(
+                    this,
+                    Manifest.permission.BLUETOOTH_CONNECT
+                ) != PackageManager.PERMISSION_GRANTED
+            ) {
                 neededPerms += Manifest.permission.BLUETOOTH_CONNECT
             }
 
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
+            if (ContextCompat.checkSelfPermission(
+                    this,
+                    Manifest.permission.BLUETOOTH_SCAN
+                ) != PackageManager.PERMISSION_GRANTED
+            ) {
                 neededPerms += Manifest.permission.BLUETOOTH_SCAN
             }
         } else {
-
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            if (ContextCompat.checkSelfPermission(
+                    this,
+                    Manifest.permission.ACCESS_FINE_LOCATION
+                ) != PackageManager.PERMISSION_GRANTED
+            ) {
                 neededPerms += Manifest.permission.ACCESS_FINE_LOCATION
             }
         }
@@ -180,7 +145,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-
     private fun pickDevice() {
         if (!bluetoothAdapter.isEnabled) {
             toast("Enable Bluetooth first")
@@ -188,9 +152,12 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-
         if (Build.VERSION.SDK_INT >= 31 &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+            ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.BLUETOOTH_CONNECT
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
             permLauncher.launch(arrayOf(Manifest.permission.BLUETOOTH_CONNECT))
             return
         }
@@ -229,18 +196,16 @@ class MainActivity : AppCompatActivity() {
                     .putString(DataService.EXTRA_DEVICE_NAME, selectedDeviceName)
                     .putString(DataService.EXTRA_DEVICE_ID, selectedDeviceAddr)
                     .apply()
-                updateStatus()
                 toast("Selected ${selectedDeviceName} (${selectedDeviceAddr})")
             }
             .setNegativeButton("Cancel", null)
             .show()
     }
 
-
     private fun startDataServiceIfReady() {
         val addr = selectedDeviceAddr
         val name = selectedDeviceName
-        val uid = etUserId.text.toString().trim()
+        val uid = userId.trim()
 
         if (uid.isBlank()) {
             toast("Enter User ID first")
@@ -250,7 +215,6 @@ class MainActivity : AppCompatActivity() {
             toast("Pick a device first")
             return
         }
-
 
         val sp = getSharedPreferences(prefsName, Context.MODE_PRIVATE)
         sp.edit()
@@ -275,7 +239,7 @@ class MainActivity : AppCompatActivity() {
     private fun openDashboard() {
         val addr = selectedDeviceAddr
         val name = selectedDeviceName
-        val uid = etUserId.text.toString().trim()
+        val uid = userId.trim()
 
         if (uid.isBlank()) {
             toast("Enter User ID first")
@@ -285,7 +249,6 @@ class MainActivity : AppCompatActivity() {
             toast("Pick a device first")
             return
         }
-
 
         startDataServiceIfReady()
 
@@ -297,14 +260,80 @@ class MainActivity : AppCompatActivity() {
         startActivity(dash)
     }
 
-
-    @Suppress("DEPRECATION")
     override fun onRequestPermissionsResult(
         requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray
+        permissions: Array<out String?>,
+        grantResults: IntArray,
+        deviceId: Int
     ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults, deviceId)
+    }
 
+
+}
+
+@Composable
+private fun MainScreen(
+    deviceName: String?,
+    deviceAddr: String?,
+    userId: String,
+    onUserIdChange: (String) -> Unit,
+    onPickDevice: () -> Unit,
+    onStartService: () -> Unit,
+    onOpenDashboard: () -> Unit
+) {
+    val name = deviceName ?: "None"
+    val addr = deviceAddr ?: "—"
+    val uid = if (userId.isBlank()) "—" else userId
+    val statusText = "Device: $name\nMAC: $addr\nUser ID: $uid"
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(24.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        Text(
+            text = "You Are Okay",
+            style = MaterialTheme.typography.headlineSmall,
+            fontWeight = FontWeight.Bold
+        )
+
+        Text(
+            text = statusText,
+            style = MaterialTheme.typography.bodyMedium
+        )
+
+        OutlinedTextField(
+            value = userId,
+            onValueChange = { onUserIdChange(it.filter { ch -> ch.isDigit() }) },
+            label = { Text("User ID") },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.fillMaxWidth()
+        )
+
+        Spacer(Modifier.height(8.dp))
+
+        Button(
+            onClick = onPickDevice,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Select Bluetooth Device")
+        }
+
+        Button(
+            onClick = onStartService,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Start Data Service")
+        }
+
+        OutlinedButton(
+            onClick = onOpenDashboard,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Open Dashboard")
+        }
     }
 }

@@ -1,4 +1,3 @@
-
 package dev.shalaga44.you_are_okay
 
 import android.content.BroadcastReceiver
@@ -36,7 +35,6 @@ class DataCollector : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-
         val deviceId = intent.getStringExtra(DataService.EXTRA_DEVICE_ID)
         val deviceName = intent.getStringExtra(DataService.EXTRA_DEVICE_NAME)
         Intent(this, DataService::class.java).apply {
@@ -63,32 +61,60 @@ private fun DataCollectorScreen() {
     var deviceLabel by remember { mutableStateOf("--") }
     var battery by remember { mutableStateOf("--") }
     var ppg by remember { mutableStateOf("--") }
+    var hr by remember { mutableStateOf("--") }
     var message by remember { mutableStateOf("") }
     var isRecording by remember { mutableStateOf(false) }
     var sessionUuid by remember { mutableStateOf("") }
 
+    var status by remember { mutableStateOf<String?>(null) }
+    var statusBasic by remember { mutableStateOf<String?>(null) }
+    var statusSliding by remember { mutableStateOf<String?>(null) }
+
+    var rmssd by remember { mutableStateOf<Double?>(null) }
+    var pnn50 by remember { mutableStateOf<Double?>(null) }
+    var mlScore by remember { mutableStateOf<Double?>(null) }
+    var mlLabel by remember { mutableStateOf<String?>(null) }
+
     val requestQueue = remember { Volley.newRequestQueue(ctx.applicationContext) }
 
-
-    LaunchedEffect(Unit) { ctx.sendBroadcast(Intent(DataService.ACTION_REQUEST_UPDATE)) }
-
+    LaunchedEffect(Unit) {
+        ctx.sendBroadcast(Intent(DataService.ACTION_REQUEST_UPDATE))
+    }
 
     DisposableEffect(Unit) {
         val filter = IntentFilter().apply { addAction(DataService.ACTION_UPDATING_STATE) }
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(c: Context, intent: Intent) {
                 if (intent.action != DataService.ACTION_UPDATING_STATE) return
+
                 intent.getStringExtra("name")?.let { deviceLabel = it }
                 intent.getStringExtra("battery")?.let { battery = it }
                 intent.getStringExtra("ppg")?.let { ppg = it }
                 intent.getStringExtra("message")?.let { message = it }
                 intent.getStringExtra("buttonState")?.let { isRecording = it.equals("true", true) }
+
+                val hrVal = intent.getIntExtra("hr", -1)
+                hr = if (hrVal >= 0) hrVal.toString() else "--"
+
+                status = intent.getStringExtra("status")
+                statusBasic = intent.getStringExtra("status_basic")
+                statusSliding = intent.getStringExtra("status_sliding")
+
+                val rm = intent.getDoubleExtra("hrv_rmssd", Double.NaN)
+                rmssd = if (rm.isNaN()) null else rm
+
+                val p50 = intent.getDoubleExtra("hrv_pnn50", Double.NaN)
+                pnn50 = if (p50.isNaN()) null else p50
+
+                val score = intent.getDoubleExtra("ml_score", Double.NaN)
+                mlScore = if (score.isNaN()) null else score
+
+                mlLabel = intent.getStringExtra("ml_label")
             }
         }
         ContextCompat.registerReceiver(ctx, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
         onDispose { runCatching { ctx.unregisterReceiver(receiver) } }
     }
-
 
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     DisposableEffect(lifecycle) {
@@ -104,16 +130,34 @@ private fun DataCollectorScreen() {
     }
 
     Column(
-        Modifier.fillMaxSize().padding(20.dp),
+        Modifier
+            .fillMaxSize()
+            .padding(20.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         Text("Collector", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
         StatRow("Device", deviceLabel)
         StatRow("Battery", if (battery == "--") "--" else "$battery%")
+        StatRow("HR", hr)
         StatRow("PPG", ppg)
         if (message.isNotBlank()) Text("Message: $message")
 
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+        Spacer(Modifier.height(12.dp))
+
+        Text("HRV / Stress", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+        StatRow("RMSSD (ms)", rmssd?.let { String.format("%.1f", it) } ?: "--")
+        StatRow("pNN50 (%)", pnn50?.let { String.format("%.1f", it) } ?: "--")
+        Text(
+            "Status: ${status ?: "--"} (basic=${statusBasic ?: "--"}, sliding=${statusSliding ?: "--"})",
+            style = MaterialTheme.typography.bodyMedium
+        )
+        StatRow("ML score", mlScore?.let { String.format("%.3f", it) } ?: "--")
+        StatRow("ML label", mlLabel ?: "--")
+
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
             Button(onClick = {
                 if (!isRecording) {
                     val savedUserId = sp.getString(DataService.EXTRA_USER_ID, "") ?: ""
@@ -137,7 +181,9 @@ private fun DataCollectorScreen() {
                         ctx.sendBroadcast(this)
                     }
                 }
-            }) { Text(if (isRecording) "Stop Recording" else "Start Recording") }
+            }) {
+                Text(if (isRecording) "Stop Recording" else "Start Recording")
+            }
 
             OutlinedButton(onClick = { ctx.sendBroadcast(Intent(DataService.ACTION_TURNOFF)) }) {
                 Text("Stop Service")

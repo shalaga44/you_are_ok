@@ -1,4 +1,3 @@
-
 package dev.shalaga44.you_are_okay
 
 import android.app.Notification
@@ -6,8 +5,11 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
@@ -22,9 +24,7 @@ import kotlin.math.max
 
 class DataService : Service() {
 
-
     private lateinit var polar: PolarController
-
 
     private var recording = false
     private var startAtMs = 0L
@@ -44,27 +44,26 @@ class DataService : Service() {
     private var lastAccY: Float? = null
     private var lastAccZ: Float? = null
 
+    // Shared HRV/stress engine (from commonMain)
+    private val stressEngine = StressEngine()
+
     companion object {
 
-        const val BASE_URL = "http://192.168.44.103:8080/api/v1"
+        const val BASE_URL = "http://192.168.44.100:8080/api/v1"
         private const val STRESS_ENDPOINT = "$BASE_URL/stress?mode=hrv"
         const val UUID_ENDPOINT = "$BASE_URL/uuid"
 
-
         private const val FLUSH_EVERY_MS = 12_000L
         private const val MAX_BATCH = 300
-
 
         private const val NOTIF_ID = 44
         private const val NOTIF_CHANNEL_ID = "you_are_okay_channel"
         private const val NOTIF_CHANNEL_NAME = "You Are Okay (Streaming)"
 
-
         const val ACTION_SENDING_STATE = "sendingState"
         const val ACTION_TURNOFF = "turnoffService"
         const val ACTION_REQUEST_UPDATE = "requestUpdate"
         const val ACTION_UPDATING_STATE = "updatingState"
-
 
         const val EXTRA_SENT = "sent"
         const val EXTRA_UUID = "gotUuid"
@@ -103,12 +102,10 @@ class DataService : Service() {
         createNotificationChannel()
         startForeground(NOTIF_ID, buildNotification("Idle"))
 
-
         val sp = getSharedPreferences("you_are_okay_prefs", MODE_PRIVATE)
         deviceId = sp.getString(EXTRA_DEVICE_ID, deviceId) ?: deviceId
         userId = sp.getString(EXTRA_USER_ID, userId) ?: userId
         deviceName = sp.getString(EXTRA_DEVICE_NAME, deviceName) ?: deviceName
-
 
         polar = PolarController(applicationContext, object : PolarController.Callbacks {
             override fun onConnected(name: String, id: String) {
@@ -116,18 +113,30 @@ class DataService : Service() {
                 deviceId = id
                 pushUiUpdate("Connected to $name")
             }
-            override fun onDisconnected() { pushUiUpdate("Disconnected") }
+            override fun onDisconnected() {
+                pushUiUpdate("Disconnected")
+            }
             override fun onBattery(percent: Int) {
                 lastBattery = percent
                 pushUiUpdate("Battery $percent%")
             }
-            override fun onHr(bpm: Int) { onHrUpdate(bpm) }
-            override fun onPpg(ppg0: Int?, ppg1: Int?, ppg2: Int?, accX: Float?, accY: Float?, accZ: Float?) {
+            override fun onHr(bpm: Int) {
+                onHrUpdate(bpm)
+            }
+            override fun onPpg(
+                ppg0: Int?,
+                ppg1: Int?,
+                ppg2: Int?,
+                accX: Float?,
+                accY: Float?,
+                accZ: Float?
+            ) {
                 onPpgSample(ppg0, ppg1, ppg2, accX, accY, accZ)
             }
-            override fun onMessage(msg: String) { pushUiUpdate(msg) }
+            override fun onMessage(msg: String) {
+                pushUiUpdate(msg)
+            }
         })
-
 
         val filter = IntentFilter().apply {
             addAction(ACTION_SENDING_STATE)
@@ -160,17 +169,23 @@ class DataService : Service() {
         Log.d("DataService", "Service destroyed")
     }
 
-
     private fun onHrUpdate(hr: Int) {
         lastHr = hr
         if (recording) maybeFlush()
     }
 
-    private fun onPpgSample(ppg0: Int?, ppg1: Int?, ppg2: Int?, accX: Float?, accY: Float?, accZ: Float?) {
+    private fun onPpgSample(
+        ppg0: Int?,
+        ppg1: Int?,
+        ppg2: Int?,
+        accX: Float?,
+        accY: Float?,
+        accZ: Float?
+    ) {
         lastAccX = accX ?: lastAccX
         lastAccY = accY ?: lastAccY
         lastAccZ = accZ ?: lastAccZ
-        lastPpg  = ppg1 ?: lastPpg
+        lastPpg = ppg1 ?: lastPpg
         if (!recording) return
 
         val now = System.currentTimeMillis()
@@ -183,7 +198,7 @@ class DataService : Service() {
             put("PPG", lastPpg ?: JSONObject.NULL)
             put("HR", lastHr ?: JSONObject.NULL)
             put("uuid", sessionUuid)
-            put("User_ID", userId) 
+            put("User_ID", userId)
             put("AccX", lastAccX ?: JSONObject.NULL)
             put("AccY", lastAccY ?: JSONObject.NULL)
             put("AccZ", lastAccZ ?: JSONObject.NULL)
@@ -194,7 +209,6 @@ class DataService : Service() {
         sampleBuffer += row
         maybeFlush()
     }
-
 
     private fun startSending(uuid: String, user: String) {
         if (recording && uuid == sessionUuid) return
@@ -210,10 +224,13 @@ class DataService : Service() {
         recording = true
         runCatching { polar.startStreaming() }
 
-
+        // Register UUID on server (optional, requires network)
         RequestSender.postObject(UUID_ENDPOINT, JSONObject().put("uuid", sessionUuid), "UUID")
         updateNotification("Recording…")
         Log.d("DataService", "startSending $sessionUuid for $userId")
+
+        // Reset engine for new session
+        stressEngine.reset()
     }
 
     private fun stopSending() {
@@ -226,7 +243,6 @@ class DataService : Service() {
         sessionUuid = ""
     }
 
-
     private fun maybeFlush() {
         val now = System.currentTimeMillis()
         if (sampleBuffer.size >= MAX_BATCH || (now - lastFlushAt) >= FLUSH_EVERY_MS) {
@@ -237,12 +253,51 @@ class DataService : Service() {
 
     private fun flushSamples(force: Boolean = false) {
         if (sampleBuffer.isEmpty()) return
-        val payload = JSONArray().apply { sampleBuffer.forEach { put(it) } }
-        sampleBuffer.clear()
-        RequestSender.postArray(STRESS_ENDPOINT, payload, "FLUSH")
-        Log.d("DataService", "Flushed ${payload.length()} samples")
-    }
 
+        // Copy and clear buffer
+        val chunk = sampleBuffer.toList()
+        sampleBuffer.clear()
+
+        // Map to shared SampleRowCommon for local HRV/ML computation
+        val rows = chunk.mapNotNull { obj ->
+            try {
+                SampleRowCommon(
+                    device = obj.optString("Device"),
+                    timeDate = obj.optString("TimeDate", null),
+                    time = obj.optString("Time", null),
+                    ppg = if (obj.isNull("PPG")) null else obj.optDouble("PPG"),
+                    hr = if (obj.isNull("HR")) null else obj.optDouble("HR"),
+                    uuid = obj.optString("uuid"),
+                    userId = obj.optString("User_ID", null),
+                    accX = if (obj.isNull("AccX")) null else obj.optDouble("AccX"),
+                    accY = if (obj.isNull("AccY")) null else obj.optDouble("AccY"),
+                    accZ = if (obj.isNull("AccZ")) null else obj.optDouble("AccZ"),
+                    ppg0 = if (obj.isNull("ppg0")) null else obj.optDouble("ppg0"),
+                    ppg2 = if (obj.isNull("ppg2")) null else obj.optDouble("ppg2")
+                )
+            } catch (e: Exception) {
+                Log.w("DataService", "Failed to map JSON to SampleRowCommon: ${e.message}")
+                null
+            }
+        }
+
+        // Local HRV / stress evaluation (offline-capable)
+        val stressResult = stressEngine.processChunk(rows, samplingHz = 50)
+
+        // Update last values and UI
+        lastHr = stressResult.hrMean?.toInt() ?: lastHr
+        lastPpg = stressResult.ppgMean?.toInt() ?: lastPpg
+        pushUiStress(stressResult)
+
+        // Optional: send to server for storage/analytics only if network is available
+        if (isNetworkAvailable()) {
+            val payload = JSONArray().apply { chunk.forEach { put(it) } }
+            RequestSender.postArray(STRESS_ENDPOINT, payload, "FLUSH")
+            Log.d("DataService", "Flushed ${payload.length()} samples (online)")
+        } else {
+            Log.d("DataService", "Flushed ${rows.size} samples (offline, not sent to server)")
+        }
+    }
 
     private fun pushUiUpdate(msg: String) {
         val i = Intent(ACTION_UPDATING_STATE).apply {
@@ -259,10 +314,39 @@ class DataService : Service() {
         sendBroadcast(i)
     }
 
+    private fun pushUiStress(res: StressResult) {
+        val i = Intent(ACTION_UPDATING_STATE).apply {
+            putExtra("message", "HRV updated")
+            putExtra("name", deviceName)
+            putExtra(EXTRA_DEVICE_ID, deviceId)
+            putExtra(EXTRA_DEVICE_NAME, deviceName)
+
+            putExtra("hr", res.hrMean?.toInt() ?: lastHr ?: -1)
+            putExtra("battery", lastBattery?.toString())
+            putExtra("ppg", res.ppgMean?.toString() ?: lastPpg?.toString())
+
+            putExtra("buttonState", recording.toString())
+            putExtra("recording", recording)
+
+            putExtra("status", res.status)
+            putExtra("status_basic", res.statusBasic)
+            putExtra("status_sliding", res.statusSliding)
+
+            putExtra("hrv_rmssd", res.rmssd ?: 0.0)
+            putExtra("hrv_pnn50", res.pnn50 ?: 0.0)
+
+            putExtra("ml_score", res.mlScore ?: Double.NaN)
+            putExtra("ml_label", res.mlLabel)
+        }
+        sendBroadcast(i)
+    }
+
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val ch = NotificationChannel(
-                NOTIF_CHANNEL_ID, NOTIF_CHANNEL_NAME, NotificationManager.IMPORTANCE_LOW
+                NOTIF_CHANNEL_ID,
+                NOTIF_CHANNEL_NAME,
+                NotificationManager.IMPORTANCE_LOW
             )
             (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
         }
@@ -274,7 +358,10 @@ class DataService : Service() {
             addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
         }
         val pi = PendingIntent.getActivity(
-            this, 0, openIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            this,
+            0,
+            openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         return NotificationCompat.Builder(this, NOTIF_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
@@ -296,5 +383,12 @@ class DataService : Service() {
         val s = (ms / 1_000) % 60
         val msR = ms % 1_000
         return "$h:$m:$s:$msR"
+    }
+
+    private fun isNetworkAvailable(): Boolean {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
+        val network = cm.activeNetwork ?: return false
+        val caps = cm.getNetworkCapabilities(network) ?: return false
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
     }
 }

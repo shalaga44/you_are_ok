@@ -20,6 +20,7 @@ import io.ktor.websocket.*
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.launch
+import org.intellij.lang.annotations.Language
 import org.jetbrains.exposed.dao.id.UUIDTable
 import org.jetbrains.exposed.sql.*
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
@@ -28,18 +29,10 @@ import org.jetbrains.exposed.sql.transactions.transaction
 import org.slf4j.event.Level
 import java.time.format.DateTimeFormatter
 import java.util.UUID
-import kotlin.math.abs
-import kotlin.math.exp
-import kotlin.math.pow
-import kotlin.math.sqrt
+
+
 
 private const val SERVER_PORT = 8080
-private const val HEART_RATE_THRESHOLD_RATIO = 1.05
-private const val RMSSD_THRESHOLD_RATIO = 1.09
-private const val PNN50_THRESHOLD_RATIO = 1.09
-private const val DEFAULT_BASELINE_FREQUENCY_HZ = 12
-private const val MIN_HEART_RATE_BPM = 30.0
-private const val MAX_HEART_RATE_BPM = 220.0
 
 data class UuidReq(val uuid: String?)
 data class UuidResp(val status: String, val message: String)
@@ -155,72 +148,7 @@ object Db {
     }
 }
 
-private fun zScoreNormalize(values: List<Double>): List<Double> {
-    if (values.isEmpty()) return values
-    val mean = values.average()
-    val sd = sqrt(values.fold(0.0) { acc, x -> acc + (x - mean).pow(2) } / values.size)
-    return if (sd == 0.0) values.map { 0.0 } else values.map { (it - mean) / sd }
-}
-
-private fun findPeaksSimple(z: List<Double>, minDistance: Int = 25, minHeight: Double = 0.5): List<Int> {
-    val out = mutableListOf<Int>()
-    var last = -minDistance
-    for (i in 1 until z.size - 1) {
-        if (z[i] > minHeight && z[i] > z[i - 1] && z[i] >= z[i + 1]) {
-            if (i - last >= minDistance) {
-                out += i
-                last = i
-            }
-        }
-    }
-    return out
-}
-
-private fun nnIntervalsFromPeaks(peaks: List<Int>, samplingHz: Int): List<Double> {
-    if (peaks.size < 2) return emptyList()
-    val msPerSample = 1000.0 / samplingHz
-    return peaks.zipWithNext().map { (a, b) -> (b - a) * msPerSample }
-}
-
-private fun computeRmssdAndPnn50(nnMs: List<Double>): Pair<Double, Double> {
-    if (nnMs.size < 3) return 0.0 to 0.0
-    val diff = nnMs.zipWithNext().map { (a, b) -> b - a }
-    val rmssd = sqrt(diff.map { it * it }.average())
-    val pnn50 = if (diff.isEmpty()) 0.0 else diff.count { abs(it) > 50.0 }.toDouble() * 100.0 / diff.size
-    return rmssd to pnn50
-}
-
-
-private fun mlStressProbability(
-    hr: Double?,
-    rmssd: Double?,
-    pnn50: Double?
-): Double? {
-    if (hr == null || rmssd == null || pnn50 == null) return null
-
-
-
-    val w0 = -44.24435565553951      // bias
-    val wHr = 0.5014126733435821
-    val wRmssd =  0.008600895019301714
-    val wPnn50 =  -0.03421459783035022
-
-    val z = w0 + wHr * hr + wRmssd * rmssd + wPnn50 * pnn50
-    return 1.0 / (1.0 + exp(-z))
-}
-
-private fun mlLabelFromScore(score: Double?): String? =
-    when {
-        score == null -> null
-        score >= 0.7 -> "ml_stress"
-        score <= 0.3 -> "ml_relaxed"
-        else -> "ml_uncertain"
-    }
-
-private fun Iterable<Double>.averageOrNull(): Double? = if (!this.iterator().hasNext()) null else this.average()
-
-private fun baselineRowCountForFrequency(freqHz: Int): Int = (10 * 60) / freqHz
-
+// Uses shared MIN_HEART_RATE_BPM / MAX_HEART_RATE_BPM
 private fun lastValidHeartRate(device: String, uuid: UUID): Double? = transaction {
     Responses
         .slice(Responses.hrMean)
@@ -654,7 +582,9 @@ fun Application.module() {
                             .toList()
                         Quadruple(
                             baseSlice.mapNotNull { it[Responses.hrvRmssd] }.averageOrNull(),
-                            baseSlice.mapNotNull { it[Responses.hrMean] }.filter { it in MIN_HEART_RATE_BPM..MAX_HEART_RATE_BPM }.averageOrNull(),
+                            baseSlice.mapNotNull { it[Responses.hrMean] }
+                                .filter { it in MIN_HEART_RATE_BPM..MAX_HEART_RATE_BPM }
+                                .averageOrNull(),
                             baseSlice.mapNotNull { it[Responses.hrvPnn50] }.averageOrNull(),
                             total.toInt()
                         )
@@ -678,7 +608,9 @@ fun Application.module() {
                                 .toList()
                             Triple(
                                 slice.mapNotNull { it[Responses.hrvRmssd] }.averageOrNull(),
-                                slice.mapNotNull { it[Responses.hrMean] }.filter { it in MIN_HEART_RATE_BPM..MAX_HEART_RATE_BPM }.averageOrNull(),
+                                slice.mapNotNull { it[Responses.hrMean] }
+                                    .filter { it in MIN_HEART_RATE_BPM..MAX_HEART_RATE_BPM }
+                                    .averageOrNull(),
                                 slice.mapNotNull { it[Responses.hrvPnn50] }.averageOrNull()
                             )
                         }
