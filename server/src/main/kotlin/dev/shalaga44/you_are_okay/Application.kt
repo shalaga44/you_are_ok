@@ -30,8 +30,6 @@ import org.slf4j.event.Level
 import java.time.format.DateTimeFormatter
 import java.util.UUID
 
-
-
 private const val SERVER_PORT = 8080
 
 data class UuidReq(val uuid: String?)
@@ -46,7 +44,9 @@ data class SampleRow(
     val uuid: String,
     @SerializedName("User_ID") val userId: String? = null,
     val AccX: Number? = null, val AccY: Number? = null, val AccZ: Number? = null,
-    val ppg0: Number? = null, val ppg2: Number? = null
+    val ppg0: Number? = null, val ppg2: Number? = null,
+    @SerializedName("ibi_ms_list")
+    val ibiMsList: List<Double>? = null
 )
 
 data class StressResp(
@@ -72,7 +72,8 @@ data class LivePoint(
     val status_basic: String?,
     val status_sliding: String?,
     val ml_score: Double? = null,
-    val ml_label: String? = null
+    val ml_label: String? = null,
+    val ibi_ms_list: List<Double>? = null
 )
 
 data class TestInfo(
@@ -131,7 +132,8 @@ object EventLabels : UUIDTable("eventlabel") {
 
 object Db {
     fun init(env: ApplicationEnvironment) {
-        val url = System.getenv("DB_URL") ?: "jdbc:postgresql://localhost:5432/you_are_okay?sslmode=disable"
+        val url = System.getenv("DB_URL")
+            ?: "jdbc:postgresql://localhost:5432/you_are_okay?sslmode=disable"
         val user = System.getenv("DB_USER") ?: "root"
         val pass = System.getenv("DB_PASS") ?: "postgres"
         val cfg = com.zaxxer.hikari.HikariConfig().apply {
@@ -148,7 +150,12 @@ object Db {
     }
 }
 
-// Uses shared MIN_HEART_RATE_BPM / MAX_HEART_RATE_BPM
+// MIN_HEART_RATE_BPM, MAX_HEART_RATE_BPM, HEART_RATE_THRESHOLD_RATIO,
+// RMSSD_THRESHOLD_RATIO, PNN50_THRESHOLD_RATIO, DEFAULT_BASELINE_FREQUENCY_HZ,
+// zScoreNormalize, findPeaksSimple, nnIntervalsFromPeaks, computeRmssdAndPnn50,
+// mlStressProbability, mlLabelFromScore, baselineRowCountForFrequency,
+// averageOrNull are expected to be in shared code.
+
 private fun lastValidHeartRate(device: String, uuid: UUID): Double? = transaction {
     Responses
         .slice(Responses.hrMean)
@@ -165,11 +172,17 @@ object LiveBus {
     val streams = java.util.concurrent.ConcurrentHashMap<String, MutableSharedFlow<LivePoint>>()
     fun flowFor(device: String, uuid: UUID): MutableSharedFlow<LivePoint> =
         streams.computeIfAbsent("$device|$uuid") {
-            MutableSharedFlow(replay = 64, extraBufferCapacity = 512, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+            MutableSharedFlow(
+                replay = 64,
+                extraBufferCapacity = 512,
+                onBufferOverflow = BufferOverflow.DROP_OLDEST
+            )
         }
+
     suspend fun emit(device: String, uuid: UUID, point: LivePoint) {
         flowFor(device, uuid).emit(point)
     }
+
     fun toJson(any: Any): String = gson.toJson(any)
 }
 
@@ -199,14 +212,17 @@ fun Application.module() {
                 val fmt = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
                 val startAt = list.firstOrNull()?.get(Responses.createdAt)?.format(fmt) ?: "-"
                 val endAt = list.lastOrNull()?.get(Responses.createdAt)?.format(fmt) ?: "-"
-                val job = Jobs.select { (Jobs.device eq device) and (Jobs.uuid eq uuid) }.firstOrNull()
+                val job =
+                    Jobs.select { (Jobs.device eq device) and (Jobs.uuid eq uuid) }.firstOrNull()
                 val freqHz = job?.get(Jobs.frequency) ?: DEFAULT_BASELINE_FREQUENCY_HZ
-                val baselineRows = job?.get(Jobs.baselineSize) ?: baselineRowCountForFrequency(freqHz)
+                val baselineRows =
+                    job?.get(Jobs.baselineSize) ?: baselineRowCountForFrequency(freqHz)
                 val hrRatio = job?.get(Jobs.hrThreshold) ?: HEART_RATE_THRESHOLD_RATIO
                 val rmssdRatio = job?.get(Jobs.hrvThreshold) ?: RMSSD_THRESHOLD_RATIO
                 TestInfo(count, startAt, endAt, freqHz, baselineRows, hrRatio, rmssdRatio)
             }
 
+            @Language("HTML")
             val html = """
                 <!doctype html>
                 <html>
@@ -265,6 +281,31 @@ fun Application.module() {
                       <div class="col-12">
                         <h4>RMSSD vs Time (live) + detections</h4>
                         <canvas id="rmssd-time-chart"></canvas>
+                      </div>
+                    </div>
+
+                    <div class="spacer"></div>
+
+                    <!-- HR vs RMSSD scatter: same size dots, stress = red, normal = grey -->
+                    <div class="row">
+                      <div class="col-12">
+                        <h4>HR vs RMSSD (stress points in red)</h4>
+                        <canvas id="hr-rmssd-scatter"></canvas>
+                      </div>
+                    </div>
+
+                    <div class="spacer"></div>
+
+                    <!-- IBI vs Time (bubble size = HRV, 120s window, pale pink) -->
+                    <div class="row">
+                      <div class="col-12">
+                        <h4>IBI vs Time (bubble size = HRV, 120s window)</h4>
+                        <canvas id="ibi-time-bubble"></canvas>
+                        <div class="mt-2 mb-3 text-center">
+                          <span id="ibi-rmssd-label" style="font-weight:bold;">
+                            RMSSD (last 120s from IBI): –
+                          </span>
+                        </div>
                       </div>
                     </div>
 
@@ -365,6 +406,7 @@ fun Application.module() {
                       };
                     }
 
+                    // RMSSD + HR vs time
                     const rmssdCtx = document.getElementById('rmssd-time-chart').getContext('2d');
                     const rmssdCfg = {
                       type: 'line',
@@ -385,8 +427,20 @@ fun Application.module() {
                         },
                         scales: {
                           x: { title: { display: true, text: 'Time' } },
-                          y1: { type: 'linear', position: 'left', title: { display: true, text: 'Heart Rate (bpm)' } },
-                          y2: { type: 'linear', position: 'right', title: { display: true, text: 'RMSSD (ms)' }, grid: { drawOnChartArea: false } }
+                          y1: {
+                            type: 'linear',
+                            position: 'left',
+                            title: { display: true, text: 'Heart Rate (bpm)', color: '#FF6384' },
+                            ticks: { color: '#FF6384' },
+                            grid: { color: 'rgba(255,99,132,0.15)' }
+                          },
+                          y2: {
+                            type: 'linear',
+                            position: 'right',
+                            title: { display: true, text: 'RMSSD (ms)', color: '#1EAEDB' },
+                            ticks: { color: '#1EAEDB' },
+                            grid: { drawOnChartArea: false, color: 'rgba(30,174,219,0.4)' }
+                          }
                         }
                       }
                     };
@@ -410,6 +464,187 @@ fun Application.module() {
                         rmssdChart.data.datasets.forEach(ds => ds.data.shift());
                       }
                       rmssdChart.update('none');
+                    }
+
+                    // HR vs RMSSD scatter (normal grey, stress red)
+                    const hrRmssdCtx = document.getElementById('hr-rmssd-scatter').getContext('2d');
+                    const hrRmssdCfg = {
+                      type: 'scatter',
+                      data: {
+                        datasets: [
+                          {
+                            label: 'Normal',
+                            data: [],
+                            borderColor: '#6B7280',
+                            backgroundColor: '#6B7280',
+                            pointRadius: 5,
+                            pointHoverRadius: 6
+                          },
+                          {
+                            label: 'Stress',
+                            data: [],
+                            borderColor: '#EF4444',
+                            backgroundColor: '#EF4444',
+                            pointRadius: 5,
+                            pointHoverRadius: 6
+                          }
+                        ]
+                      },
+                      options: {
+                        responsive: true,
+                        plugins: {
+                          title: { display: true, text: 'HR vs RMSSD (stress points in red)' },
+                          legend: { display: true }
+                        },
+                        scales: {
+                          x: {
+                            type: 'linear',
+                            title: { display: true, text: 'Heart Rate (bpm)' }
+                          },
+                          y: {
+                            type: 'linear',
+                            title: { display: true, text: 'RMSSD (ms)' }
+                          }
+                        }
+                      }
+                    };
+                    const hrRmssdChart = new Chart(hrRmssdCtx, hrRmssdCfg);
+
+                    function pushHrRmssdPoint(hr, rmssd, isStress) {
+                      if (hr == null || rmssd == null || !isFinite(hr) || !isFinite(rmssd)) return;
+                      const dsIndex = isStress ? 1 : 0;
+                      const ds = hrRmssdChart.data.datasets[dsIndex];
+                      ds.data.push({ x: hr, y: rmssd });
+
+                      let total = 0;
+                      for (let i = 0; i < hrRmssdChart.data.datasets.length; i++) {
+                        total += hrRmssdChart.data.datasets[i].data.length;
+                      }
+                      if (total > MAX_POINTS) {
+                        for (let i = 0; i < hrRmssdChart.data.datasets.length; i++) {
+                          const d = hrRmssdChart.data.datasets[i].data;
+                          if (d.length > 0) d.shift();
+                        }
+                      }
+
+                      hrRmssdChart.update('none');
+                    }
+
+                    // IBI vs Time bubble chart (x: seconds from start, y: IBI 400–1400ms, r = HRV (rmssd), pale pink, window=120s)
+                    const ibiTimeCtx = document.getElementById('ibi-time-bubble').getContext('2d');
+                    const ibiTimeCfg = {
+                      type: 'bubble',
+                      data: {
+                        datasets: [
+                          {
+                            label: 'IBI vs Time',
+                            data: [],
+                            borderColor: '#F472B6',
+                            backgroundColor: '#F9A8D4AA'
+                          }
+                        ]
+                      },
+                      options: {
+                        responsive: true,
+                        plugins: {
+                          title: { display: true, text: 'IBI vs Time (bubble size = HRV, pale pink, 120s window)' },
+                          legend: { display: false }
+                        },
+                        scales: {
+                          x: {
+                            type: 'linear',
+                            title: { display: true, text: 'Time (HH:MM from start)' },
+                            ticks: {
+                              callback: function(value) {
+                                const sec = Number(value) || 0;
+                                const h = Math.floor(sec / 3600);
+                                const m = Math.floor((sec % 3600) / 60);
+                                const hh = h.toString().padStart(2,'0');
+                                const mm = m.toString().padStart(2,'0');
+                                return hh + ':' + mm;
+                              }
+                            }
+                          },
+                          y: {
+                            type: 'linear',
+                            title: { display: true, text: 'IBI (ms)' },
+                            min: 400,
+                            max: 1400
+                          }
+                        }
+                      }
+                    };
+                    const ibiTimeChart = new Chart(ibiTimeCtx, ibiTimeCfg);
+
+                    let ibiVirtualTimeSec = 0.0; // cumulative beat time in seconds
+                    let ibiWindow = [];          // [{ t: seconds, ibi: ms }]
+
+                    function computeRmssdFromIbi(ibiArrMs) {
+                      if (!ibiArrMs || ibiArrMs.length < 3) return null;
+                      const diffs = [];
+                      for (let i = 0; i < ibiArrMs.length - 1; i++) {
+                        const d = ibiArrMs[i + 1] - ibiArrMs[i];
+                        diffs.push(d);
+                      }
+                      if (diffs.length === 0) return null;
+                      let sumSq = 0;
+                      for (let i = 0; i < diffs.length; i++) {
+                        const d = diffs[i];
+                        sumSq += d * d;
+                      }
+                      const meanSq = sumSq / diffs.length;
+                      return Math.sqrt(meanSq);
+                    }
+
+                    function pushIbiPoints(ibiListMs, rmssdValue) {
+                      if (!ibiListMs || ibiListMs.length === 0) return;
+                      const ds = ibiTimeChart.data.datasets[0];
+
+                      const maxRmssdForRadius = 200.0;
+                      const minR = 3.0;
+                      const maxR = 18.0;
+                      const rNorm = (typeof rmssdValue === 'number')
+                        ? Math.min(rmssdValue, maxRmssdForRadius) / maxRmssdForRadius
+                        : 0.5;
+                      const radius = minR + rNorm * (maxR - minR);
+
+                      for (let i = 0; i < ibiListMs.length; i++) {
+                        const ibiMs = ibiListMs[i];
+                        if (typeof ibiMs !== 'number' || !isFinite(ibiMs)) continue;
+
+                        ibiVirtualTimeSec += ibiMs / 1000.0;
+                        const tSec = ibiVirtualTimeSec;
+
+                        // For plotting, clamp to [400, 1400] on the axis, but keep real ibi in window for RMSSD
+                        let ibiPlot = ibiMs;
+                        if (ibiPlot < 400.0) ibiPlot = 400.0;
+                        if (ibiPlot > 1400.0) ibiPlot = 1400.0;
+
+                        ds.data.push({ x: tSec, y: ibiPlot, r: radius });
+                        ibiWindow.push({ t: tSec, ibi: ibiMs }); // real IBI for RMSSD
+                      }
+
+                      const windowSizeSec = 120.0;
+                      const windowStart = Math.max(0, ibiVirtualTimeSec - windowSizeSec);
+
+                      ds.data = ds.data.filter(p => p.x >= windowStart);
+                      ibiWindow = ibiWindow.filter(p => p.t >= windowStart);
+
+                      const ibiArr = ibiWindow.map(p => p.ibi);
+                      const rmssdWin = computeRmssdFromIbi(ibiArr);
+                      const lbl = document.getElementById('ibi-rmssd-label');
+                      if (lbl) {
+                        if (rmssdWin == null) {
+                          lbl.textContent = 'RMSSD (last 120s from IBI): –';
+                        } else {
+                          lbl.textContent = 'RMSSD (last 120s from IBI): ' + rmssdWin.toFixed(0) + ' ms';
+                        }
+                      }
+
+                      ibiTimeChart.options.scales.x.min = windowStart;
+                      ibiTimeChart.options.scales.x.max = windowStart + windowSizeSec;
+
+                      ibiTimeChart.update('none');
                     }
 
                     const ppgCtx = document.getElementById('ppg-row-chart').getContext('2d');
@@ -455,16 +690,32 @@ fun Application.module() {
                       const p = JSON.parse(evt.data);
                       const basic = p.status_basic === 'basic_warning';
                       const sliding = p.status_sliding === 'sliding_warning';
+                      const isStress = basic || sliding;
 
-                      // ML from live point
                       const mlScore = (typeof p.ml_score === 'number') ? p.ml_score : null;
                       const mlLabel = p.ml_label || null;
                       updateMlStatus(mlScore, mlLabel);
 
                       if (typeof p.t === 'number') {
-                        pushRmssdPoint(p.t, p.hr_mean ?? null, p.rmssd ?? null, basic, sliding);
-                        pushPpgRowPoint(p.hr_mean ?? null, p.ppg_mean ?? null);
+                        const ts = p.t;
+                        const hr = (typeof p.hr_mean === 'number') ? p.hr_mean : null;
+                        const rmssd = (typeof p.rmssd === 'number') ? p.rmssd : null;
+                        const ppgMean = (typeof p.ppg_mean === 'number') ? p.ppg_mean : null;
+                        const ibiList = Array.isArray(p.ibi_ms_list)
+                          ? p.ibi_ms_list.filter(x => typeof x === 'number' && isFinite(x))
+                          : null;
+
+                        pushRmssdPoint(ts, hr, rmssd, basic, sliding);
+                        pushPpgRowPoint(hr, ppgMean);
                         updateEventCounters(basic, sliding);
+
+                        if (hr != null && rmssd != null) {
+                          pushHrRmssdPoint(hr, rmssd, isStress);
+                        }
+
+                        if (ibiList && ibiList.length > 0 && rmssd != null) {
+                          pushIbiPoints(ibiList, rmssd);
+                        }
                       }
                     };
                     ws.onopen = () => console.log('WS open');
@@ -505,7 +756,10 @@ fun Application.module() {
                 val mode = call.request.queryParameters["mode"] ?: "hrv"
                 val rows = runCatching { call.receive<List<SampleRow>>() }.getOrNull()
                 if (rows.isNullOrEmpty()) {
-                    call.respond(HttpStatusCode.BadRequest, mapOf("status" to "error", "message" to "Empty payload"))
+                    call.respond(
+                        HttpStatusCode.BadRequest,
+                        mapOf("status" to "error", "message" to "Empty payload")
+                    )
                     return@post
                 }
 
@@ -516,13 +770,20 @@ fun Application.module() {
 
                 val hrRaw = rows.mapNotNull { it.hr?.toDouble() }
                 val hrVals = hrRaw.filter { it in MIN_HEART_RATE_BPM..MAX_HEART_RATE_BPM }
-                val hrMean: Double? = if (hrVals.isNotEmpty()) hrVals.averageOrNull() else lastValidHeartRate(device, uuid)
+                val hrMean: Double? =
+                    if (hrVals.isNotEmpty()) hrVals.averageOrNull() else lastValidHeartRate(
+                        device,
+                        uuid
+                    )
+                val ibiMsList: List<Double> = rows
+                    .flatMap { it.ibiMsList ?: emptyList() }
 
                 val ppgVals = rows.mapNotNull { it.ppg?.toDouble() }
                 val ppgMean = ppgVals.averageOrNull()
 
                 val (frequencyHz, baselineRows, hrRatio, rmssdRatio) = transaction {
-                    val existing = Jobs.select { (Jobs.device eq device) and (Jobs.uuid eq uuid) }.firstOrNull()
+                    val existing = Jobs.select { (Jobs.device eq device) and (Jobs.uuid eq uuid) }
+                        .firstOrNull()
                     if (existing == null) {
                         val f = DEFAULT_BASELINE_FREQUENCY_HZ
                         val b = baselineRowCountForFrequency(f)
@@ -563,12 +824,17 @@ fun Application.module() {
                 var statusSliding = "success"
 
                 if (mode == "hrv") {
+                    // Fallback: PPG-based if no IBIs
                     val norm = zScoreNormalize(ppgVals)
                     val peaks = findPeaksSimple(norm, minDistance = 50, minHeight = 0.2)
-                    val nn = nnIntervalsFromPeaks(peaks, samplingHz = 50)
-                    val (rm, p50) = computeRmssdAndPnn50(nn)
-                    rmssd = rm
-                    pnn50 = p50
+                    val nnFromPeaks = nnIntervalsFromPeaks(peaks, samplingHz = 50)
+
+                    // Choose REAL IBIs if present, otherwise keep old PPG-derived method
+                    val nnMs: List<Double> = if (ibiMsList.isNotEmpty()) ibiMsList else nnFromPeaks
+
+                    val (rm, p50) = computeRmssdAndPnn50(nnMs)
+                    val rmssd = rm
+                    val pnn50 = p50
 
                     val (baseRmssd, baseHr, basePnn, totalCount) = transaction {
                         val total = Responses
@@ -591,10 +857,14 @@ fun Application.module() {
                     }
 
                     if (totalCount > baselineRows) {
-                        val basicHrvDrop = (rmssd != null && baseRmssd != null && rmssd!! * rmssdRatio < baseRmssd)
-                        val basicHrRise  = (hrMean != null && baseHr != null && hrMean!! > baseHr * hrRatio)
-                        val basicPnnDrop = (pnn50 != null && basePnn != null && pnn50!! * PNN50_THRESHOLD_RATIO < basePnn)
-                        if (basicHrvDrop && basicHrRise && basicPnnDrop) statusBasic = "basic_warning"
+                        val basicHrvDrop =
+                            (rmssd != null && baseRmssd != null && rmssd!! * rmssdRatio < baseRmssd)
+                        val basicHrRise =
+                            (hrMean != null && baseHr != null && hrMean!! > baseHr * hrRatio)
+                        val basicPnnDrop =
+                            (pnn50 != null && basePnn != null && pnn50!! * PNN50_THRESHOLD_RATIO < basePnn)
+                        if (basicHrvDrop && basicHrRise && basicPnnDrop) statusBasic =
+                            "basic_warning"
                     }
 
                     if (totalCount > baselineRows) {
@@ -614,10 +884,14 @@ fun Application.module() {
                                 slice.mapNotNull { it[Responses.hrvPnn50] }.averageOrNull()
                             )
                         }
-                        val slideHrvDrop = (rmssd != null && winRmssd != null && rmssd!! * rmssdRatio < winRmssd)
-                        val slideHrRise  = (hrMean != null && winHr != null && hrMean!! > winHr * hrRatio)
-                        val slidePnnDrop = (pnn50 != null && winPnn != null && pnn50!! * PNN50_THRESHOLD_RATIO < winPnn)
-                        if (slideHrvDrop && slideHrRise && slidePnnDrop) statusSliding = "sliding_warning"
+                        val slideHrvDrop =
+                            (rmssd != null && winRmssd != null && rmssd!! * rmssdRatio < winRmssd)
+                        val slideHrRise =
+                            (hrMean != null && winHr != null && hrMean!! > winHr * hrRatio)
+                        val slidePnnDrop =
+                            (pnn50 != null && winPnn != null && pnn50!! * PNN50_THRESHOLD_RATIO < winPnn)
+                        if (slideHrvDrop && slideHrRise && slidePnnDrop) statusSliding =
+                            "sliding_warning"
                     }
 
                     if (statusBasic == "basic_warning" || statusSliding == "sliding_warning") {
@@ -661,7 +935,8 @@ fun Application.module() {
                                 status_basic = statusBasic,
                                 status_sliding = statusSliding,
                                 ml_score = mlScore,
-                                ml_label = mlLabel
+                                ml_label = mlLabel,
+                                ibi_ms_list = ibiMsList.ifEmpty { null }
                             )
                         )
                     }
@@ -704,7 +979,8 @@ fun Application.module() {
                                 status_basic = "success",
                                 status_sliding = "success",
                                 ml_score = null,
-                                ml_label = null
+                                ml_label = null,
+                                ibi_ms_list = null
                             )
                         )
                     }
@@ -726,10 +1002,20 @@ fun Application.module() {
 
             webSocket("/ws") {
                 val device = call.request.queryParameters["device"] ?: run {
-                    close(CloseReason(CloseReason.Codes.CANNOT_ACCEPT, "device required")); return@webSocket
+                    close(
+                        CloseReason(
+                            CloseReason.Codes.CANNOT_ACCEPT,
+                            "device required"
+                        )
+                    ); return@webSocket
                 }
                 val uuid = call.request.queryParameters["uuid"]?.toUuidOrNull() ?: run {
-                    close(CloseReason(CloseReason.Codes.CANNOT_ACCEPT, "uuid required")); return@webSocket
+                    close(
+                        CloseReason(
+                            CloseReason.Codes.CANNOT_ACCEPT,
+                            "uuid required"
+                        )
+                    ); return@webSocket
                 }
                 val flow = LiveBus.flowFor(device, uuid)
                 val job = launch {
@@ -737,7 +1023,12 @@ fun Application.module() {
                         send(Frame.Text(LiveBus.toJson(point)))
                     }
                 }
-                try { for (@Suppress("UNUSED_VARIABLE") f in incoming) {} } finally { job.cancel() }
+                try {
+                    for (@Suppress("UNUSED_VARIABLE") f in incoming) {
+                    }
+                } finally {
+                    job.cancel()
+                }
             }
         }
     }
@@ -749,5 +1040,7 @@ fun String.toUuidOrNull(): UUID? = runCatching { toUuidOrOrThrow() }.getOrNull()
 fun String.toUuidOrOrThrow(): UUID = UUID.fromString(this@toUuidOrOrThrow.trim())
 
 fun main() {
-    embeddedServer(Netty, port = SERVER_PORT, host = "0.0.0.0", module = Application::module).start(wait = true)
+    embeddedServer(Netty, port = SERVER_PORT, host = "0.0.0.0", module = Application::module).start(
+        wait = true
+    )
 }

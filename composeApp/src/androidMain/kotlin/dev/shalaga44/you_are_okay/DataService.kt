@@ -39,6 +39,7 @@ class DataService : Service() {
 
     private var lastHr: Int? = null
     private var lastPpg: Int? = null
+    private var lastIbiMsList: List<Int> = emptyList()
     private var lastBattery: Int? = null
     private var lastAccX: Float? = null
     private var lastAccY: Float? = null
@@ -113,16 +114,22 @@ class DataService : Service() {
                 deviceId = id
                 pushUiUpdate("Connected to $name")
             }
+
             override fun onDisconnected() {
                 pushUiUpdate("Disconnected")
             }
+
             override fun onBattery(percent: Int) {
                 lastBattery = percent
                 pushUiUpdate("Battery $percent%")
             }
+
             override fun onHr(bpm: Int) {
                 onHrUpdate(bpm)
             }
+
+            // PPG is now only used as context (waveform / last value),
+            // samples are NOT pushed from here anymore.
             override fun onPpg(
                 ppg0: Int?,
                 ppg1: Int?,
@@ -133,6 +140,12 @@ class DataService : Service() {
             ) {
                 onPpgSample(ppg0, ppg1, ppg2, accX, accY, accZ)
             }
+
+            // IBI-driven samples: each PPI batch becomes one JSON row
+            override fun onIbi(ibiMsList: List<Int>) {
+                onIbiSample(ibiMsList)
+            }
+
             override fun onMessage(msg: String) {
                 pushUiUpdate(msg)
             }
@@ -169,11 +182,18 @@ class DataService : Service() {
         Log.d("DataService", "Service destroyed")
     }
 
+    // ---------------- HR / PPG / IBI HANDLERS ----------------
+
     private fun onHrUpdate(hr: Int) {
         lastHr = hr
         if (recording) maybeFlush()
     }
 
+    /**
+     * PPG handler is now "state only":
+     * - update lastPpg, lastAccX/Y/Z
+     * - DO NOT push samples; main samples are IBI-driven
+     */
     private fun onPpgSample(
         ppg0: Int?,
         ppg1: Int?,
@@ -186,10 +206,27 @@ class DataService : Service() {
         lastAccY = accY ?: lastAccY
         lastAccZ = accZ ?: lastAccZ
         lastPpg = ppg1 ?: lastPpg
+        // No JSON row here. IBI is the driver.
+    }
+
+    /**
+     * IBI-driven sample creation:
+     * - one JSON row per PPI frame
+     * - attaches latest HR / PPG / ACC
+     * - includes ibi_ms_list array
+     */
+    private fun onIbiSample(ibiMsList: List<Int>) {
         if (!recording) return
+        if (ibiMsList.isEmpty()) return
+
+        lastIbiMsList = ibiMsList
 
         val now = System.currentTimeMillis()
         val elapsed = max(0L, now - startAtMs)
+
+        val ibiJson = JSONArray().apply {
+            ibiMsList.forEach { put(it) }
+        }
 
         val row = JSONObject().apply {
             put("Device", deviceName)
@@ -202,13 +239,22 @@ class DataService : Service() {
             put("AccX", lastAccX ?: JSONObject.NULL)
             put("AccY", lastAccY ?: JSONObject.NULL)
             put("AccZ", lastAccZ ?: JSONObject.NULL)
-            put("ppg0", ppg0 ?: JSONObject.NULL)
-            put("ppg2", ppg2 ?: JSONObject.NULL)
+            put("ppg0", JSONObject.NULL)   // optional, you can store last ppg0/ppg2 if you want
+            put("ppg2", JSONObject.NULL)
+            put("ibi_ms_list", ibiJson)
+            put("sample_type", "ibi")
         }
-        Log.d("DataService", "Sending sample uuid=$sessionUuid userId=$userId hr=$lastHr ppg=$lastPpg")
+
+        Log.d(
+            "DataService",
+            "Sending IBI sample uuid=$sessionUuid userId=$userId hr=$lastHr ibi_ms_list=${ibiMsList.joinToString(",")}"
+        )
+
         sampleBuffer += row
         maybeFlush()
     }
+
+    // ---------------- RECORDING CONTROL ----------------
 
     private fun startSending(uuid: String, user: String) {
         if (recording && uuid == sessionUuid) return
@@ -221,6 +267,7 @@ class DataService : Service() {
         startAtMs = System.currentTimeMillis()
         lastFlushAt = startAtMs
         sampleBuffer.clear()
+        lastIbiMsList = emptyList()
         recording = true
         runCatching { polar.startStreaming() }
 
@@ -241,7 +288,10 @@ class DataService : Service() {
         updateNotification("Idle")
         Log.d("DataService", "stopSending $sessionUuid")
         sessionUuid = ""
+        lastIbiMsList = emptyList()
     }
+
+    // ---------------- BUFFER / FLUSH ----------------
 
     private fun maybeFlush() {
         val now = System.currentTimeMillis()
@@ -258,7 +308,6 @@ class DataService : Service() {
         val chunk = sampleBuffer.toList()
         sampleBuffer.clear()
 
-        // Map to shared SampleRowCommon for local HRV/ML computation
         val rows = chunk.mapNotNull { obj ->
             try {
                 SampleRowCommon(
@@ -281,23 +330,23 @@ class DataService : Service() {
             }
         }
 
-        // Local HRV / stress evaluation (offline-capable)
-        val stressResult = stressEngine.processChunk(rows, samplingHz = 50)
+        // Local HRV / stress evaluation (still PPG-based unless you extend it for IBI)
+        val stressResult = stressEngine.processChunk(rows, samplingHz = 130)
 
-        // Update last values and UI
         lastHr = stressResult.hrMean?.toInt() ?: lastHr
         lastPpg = stressResult.ppgMean?.toInt() ?: lastPpg
         pushUiStress(stressResult)
 
-        // Optional: send to server for storage/analytics only if network is available
         if (isNetworkAvailable()) {
             val payload = JSONArray().apply { chunk.forEach { put(it) } }
             RequestSender.postArray(STRESS_ENDPOINT, payload, "FLUSH")
-            Log.d("DataService", "Flushed ${payload.length()} samples (online)")
+            Log.d("DataService", "Flushed ${payload.length()} IBI-driven samples (online)")
         } else {
-            Log.d("DataService", "Flushed ${rows.size} samples (offline, not sent to server)")
+            Log.d("DataService", "Flushed ${rows.size} IBI-driven samples (offline, not sent to server)")
         }
     }
+
+    // ---------------- UI / NOTIFICATION ----------------
 
     private fun pushUiUpdate(msg: String) {
         val i = Intent(ACTION_UPDATING_STATE).apply {

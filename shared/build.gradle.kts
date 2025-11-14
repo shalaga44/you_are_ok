@@ -37,6 +37,8 @@ kotlin {
     
     sourceSets {
         commonMain.dependencies {
+            implementation("com.google.code.gson:gson:2.13.2")
+
             // put your Multiplatform dependencies here
         }
         commonTest.dependencies {

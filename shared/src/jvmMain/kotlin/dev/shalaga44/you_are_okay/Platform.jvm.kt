@@ -1,5 +1,7 @@
 package dev.shalaga44.you_are_okay
 
+import com.google.gson.Gson
+
 class JVMPlatform: Platform {
     override val name: String = "Java ${System.getProperty("java.version")}"
 }
